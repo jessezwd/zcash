@@ -101,6 +101,16 @@ public:
         saveToFile(pkPath, keypair.pk);
     }
 
+    void saveR1CS(std::string path)
+    {
+        protoboard<FieldT> pb;
+        joinsplit_gadget<FieldT, NumInputs, NumOutputs> g(pb);
+        g.generate_r1cs_constraints();
+        r1cs_constraint_system<FieldT> r1cs = pb.get_constraint_system();
+
+        saveToFile(path, r1cs);
+    }
+
     bool verify(
         const PHGRProof& proof,
         ProofVerifier& verifier,
@@ -428,10 +438,10 @@ JSOutput::JSOutput() : addr(uint256(), uint256()), value(0) {
     addr = a_sk.address();
 }
 
-JSInput::JSInput() : witness(ZCIncrementalMerkleTree().witness()),
+JSInput::JSInput() : witness(SproutMerkleTree().witness()),
                      key(SproutSpendingKey::random()) {
     note = SproutNote(key.address().a_pk, 0, random_uint256(), random_uint256());
-    ZCIncrementalMerkleTree dummy_tree;
+    SproutMerkleTree dummy_tree;
     dummy_tree.append(note.cm());
     witness = dummy_tree.witness();
 }

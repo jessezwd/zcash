@@ -24,6 +24,20 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
     if (pindexLast == NULL)
         return nProofOfWorkLimit;
 
+    {
+        // Comparing to pindexLast->nHeight with >= because this function
+        // returns the work required for the block after pindexLast.
+        if (params.nPowAllowMinDifficultyBlocksAfterHeight != boost::none &&
+            pindexLast->nHeight >= params.nPowAllowMinDifficultyBlocksAfterHeight.get())
+        {
+            // Special difficulty rule for testnet:
+            // If the new block's timestamp is more than 6 * 2.5 minutes
+            // then allow mining of a min-difficulty block.
+            if (pblock && pblock->GetBlockTime() > pindexLast->GetBlockTime() + params.nPowTargetSpacing * 6)
+                return nProofOfWorkLimit;
+        }
+    }
+
     // Find the first block in the averaging interval
     const CBlockIndex* pindexFirst = pindexLast;
     arith_uint256 bnTot {0};
@@ -77,10 +91,10 @@ unsigned int CalculateNextWorkRequired(arith_uint256 bnAvg,
     return bnNew.GetCompact();
 }
 
-bool CheckEquihashSolution(const CBlockHeader *pblock, const CChainParams& params)
+bool CheckEquihashSolution(const CBlockHeader *pblock, const Consensus::Params& params)
 {
-    unsigned int n = params.EquihashN();
-    unsigned int k = params.EquihashK();
+    unsigned int n = params.nEquihashN;
+    unsigned int k = params.nEquihashK;
 
     // Hash state
     crypto_generichash_blake2b_state state;

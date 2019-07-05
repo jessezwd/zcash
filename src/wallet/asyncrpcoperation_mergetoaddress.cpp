@@ -13,8 +13,8 @@
 #include "miner.h"
 #include "net.h"
 #include "netbase.h"
-#include "rpcprotocol.h"
-#include "rpcserver.h"
+#include "rpc/protocol.h"
+#include "rpc/server.h"
 #include "script/interpreter.h"
 #include "sodium.h"
 #include "timedata.h"
@@ -23,6 +23,7 @@
 #include "utiltime.h"
 #include "wallet.h"
 #include "walletdb.h"
+#include "wallet/paymentdisclosuredb.h"
 #include "zcash/IncrementalMerkleTree.hpp"
 
 #include <chrono>
@@ -30,9 +31,9 @@
 #include <string>
 #include <thread>
 
-#include "paymentdisclosuredb.h"
-
 using namespace libzcash;
+
+extern UniValue sendrawtransaction(const UniValue& params, bool fHelp);
 
 int mta_find_output(UniValue obj, int n)
 {
@@ -53,25 +54,41 @@ int mta_find_output(UniValue obj, int n)
 }
 
 AsyncRPCOperation_mergetoaddress::AsyncRPCOperation_mergetoaddress(
+    boost::optional<TransactionBuilder> builder,
     CMutableTransaction contextualTx,
     std::vector<MergeToAddressInputUTXO> utxoInputs,
-    std::vector<MergeToAddressInputNote> noteInputs,
+    std::vector<MergeToAddressInputSproutNote> sproutNoteInputs,
+    std::vector<MergeToAddressInputSaplingNote> saplingNoteInputs,
     MergeToAddressRecipient recipient,
     CAmount fee,
     UniValue contextInfo) :
-    tx_(contextualTx), utxoInputs_(utxoInputs), noteInputs_(noteInputs),
-    recipient_(recipient), fee_(fee), contextinfo_(contextInfo)
+    tx_(contextualTx), utxoInputs_(utxoInputs), sproutNoteInputs_(sproutNoteInputs),
+    saplingNoteInputs_(saplingNoteInputs), recipient_(recipient), fee_(fee), contextinfo_(contextInfo)
 {
     if (fee < 0 || fee > MAX_MONEY) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Fee is out of range");
     }
 
-    if (utxoInputs.empty() && noteInputs.empty()) {
+    if (utxoInputs.empty() && sproutNoteInputs.empty() && saplingNoteInputs.empty()) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "No inputs");
     }
 
     if (std::get<0>(recipient).size() == 0) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Recipient parameter missing");
+    }
+
+    if (sproutNoteInputs.size() > 0 && saplingNoteInputs.size() > 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot send from both Sprout and Sapling addresses using z_mergetoaddress");
+    }
+
+    if (sproutNoteInputs.size() > 0 && builder) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Sprout notes are not supported by the TransactionBuilder");
+    }
+
+    isUsingBuilder_ = false;
+    if (builder) {
+        isUsingBuilder_ = true;
+        builder_ = builder.get();
     }
 
     toTaddr_ = DecodeDestination(std::get<0>(recipient));
@@ -82,8 +99,6 @@ AsyncRPCOperation_mergetoaddress::AsyncRPCOperation_mergetoaddress(
         auto address = DecodePaymentAddress(std::get<0>(recipient));
         if (IsValidPaymentAddress(address)) {
             isToZaddr_ = true;
-            // TODO: Add Sapling support. For now, ensure we can later convert freely.
-            assert(boost::get<libzcash::SproutPaymentAddress>(&address) != nullptr);
             toPaymentAddress_ = address;
         } else {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid recipient address");
@@ -123,11 +138,7 @@ void AsyncRPCOperation_mergetoaddress::main()
     bool success = false;
 
 #ifdef ENABLE_MINING
-#ifdef ENABLE_WALLET
-    GenerateBitcoins(false, NULL, 0);
-#else
-    GenerateBitcoins(false, 0);
-#endif
+    GenerateBitcoins(false, 0, Params());
 #endif
 
     try {
@@ -152,11 +163,7 @@ void AsyncRPCOperation_mergetoaddress::main()
     }
 
 #ifdef ENABLE_MINING
-#ifdef ENABLE_WALLET
-    GenerateBitcoins(GetBoolArg("-gen", false), pwalletMain, GetArg("-genproclimit", 1));
-#else
-    GenerateBitcoins(GetBoolArg("-gen", false), GetArg("-genproclimit", 1));
-#endif
+    GenerateBitcoins(GetBoolArg("-gen", false), GetArg("-genproclimit", 1), Params());
 #endif
 
     stop_execution_clock();
@@ -201,7 +208,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
 {
     assert(isToTaddr_ != isToZaddr_);
 
-    bool isPureTaddrOnlyTx = (noteInputs_.empty() && isToTaddr_);
+    bool isPureTaddrOnlyTx = (sproutNoteInputs_.empty() && saplingNoteInputs_.empty() && isToTaddr_);
     CAmount minersFee = fee_;
 
     size_t numInputs = utxoInputs_.size();
@@ -226,7 +233,11 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
     }
 
     CAmount z_inputs_total = 0;
-    for (MergeToAddressInputNote& t : noteInputs_) {
+    for (const MergeToAddressInputSproutNote& t : sproutNoteInputs_) {
+        z_inputs_total += std::get<2>(t);
+    }
+
+    for (const MergeToAddressInputSaplingNote& t : saplingNoteInputs_) {
         z_inputs_total += std::get<2>(t);
     }
 
@@ -241,17 +252,19 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
     CAmount sendAmount = targetAmount - minersFee;
 
     // update the transaction with the UTXO inputs and output (if any)
-    CMutableTransaction rawTx(tx_);
-    for (MergeToAddressInputUTXO& t : utxoInputs_) {
-        CTxIn in(std::get<0>(t));
-        rawTx.vin.push_back(in);
+    if (!isUsingBuilder_) {
+        CMutableTransaction rawTx(tx_);
+        for (const MergeToAddressInputUTXO& t : utxoInputs_) {
+            CTxIn in(std::get<0>(t));
+            rawTx.vin.push_back(in);
+        }
+        if (isToTaddr_) {
+            CScript scriptPubKey = GetScriptForDestination(toTaddr_);
+            CTxOut out(sendAmount, scriptPubKey);
+            rawTx.vout.push_back(out);
+        }
+        tx_ = CTransaction(rawTx);
     }
-    if (isToTaddr_) {
-        CScript scriptPubKey = GetScriptForDestination(toTaddr_);
-        CTxOut out(sendAmount, scriptPubKey);
-        rawTx.vout.push_back(out);
-    }
-    tx_ = CTransaction(rawTx);
 
     LogPrint(isPureTaddrOnlyTx ? "zrpc" : "zrpcunsafe", "%s: spending %s to send %s with fee %s\n",
              getId(), FormatMoney(targetAmount), FormatMoney(sendAmount), FormatMoney(minersFee));
@@ -269,6 +282,116 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
         LOCK(cs_main);
         consensusBranchId_ = CurrentEpochBranchId(chainActive.Height() + 1, Params().GetConsensus());
     }
+
+    /**
+     * SCENARIO #0
+     *
+     * Sprout not involved, so we just use the TransactionBuilder and we're done.
+     * 
+     * This is based on code from AsyncRPCOperation_sendmany::main_impl() and should be refactored.
+     */
+    if (isUsingBuilder_) {
+        builder_.SetFee(minersFee);
+
+
+        for (const MergeToAddressInputUTXO& t : utxoInputs_) {
+            COutPoint outPoint = std::get<0>(t);
+            CAmount amount = std::get<1>(t);
+            CScript scriptPubKey = std::get<2>(t);
+            builder_.AddTransparentInput(outPoint, scriptPubKey, amount);
+        }
+
+        boost::optional<uint256> ovk;
+        // Select Sapling notes
+        std::vector<SaplingOutPoint> saplingOPs;
+        std::vector<SaplingNote> saplingNotes;
+        std::vector<SaplingExpandedSpendingKey> expsks;
+        for (const MergeToAddressInputSaplingNote& saplingNoteInput: saplingNoteInputs_) {
+            saplingOPs.push_back(std::get<0>(saplingNoteInput));
+            saplingNotes.push_back(std::get<1>(saplingNoteInput));
+            auto expsk = std::get<3>(saplingNoteInput);
+            expsks.push_back(expsk);
+            if (!ovk) {
+                ovk = expsk.full_viewing_key().ovk;
+            }
+        }
+
+        // Fetch Sapling anchor and witnesses
+        uint256 anchor;
+        std::vector<boost::optional<SaplingWitness>> witnesses;
+        {
+            LOCK2(cs_main, pwalletMain->cs_wallet);
+            pwalletMain->GetSaplingNoteWitnesses(saplingOPs, witnesses, anchor);
+        }
+
+        // Add Sapling spends
+        for (size_t i = 0; i < saplingNotes.size(); i++) {
+            if (!witnesses[i]) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Missing witness for Sapling note");
+            }
+            builder_.AddSaplingSpend(expsks[i], saplingNotes[i], anchor, witnesses[i].get());
+        }
+
+        if (isToTaddr_) {
+            builder_.AddTransparentOutput(toTaddr_, sendAmount);
+        } else {
+            std::string zaddr = std::get<0>(recipient_);
+            std::string memo = std::get<1>(recipient_);
+            std::array<unsigned char, ZC_MEMO_SIZE> hexMemo = get_memo_from_hex_string(memo);
+            auto saplingPaymentAddress = boost::get<libzcash::SaplingPaymentAddress>(&toPaymentAddress_);
+            if (saplingPaymentAddress == nullptr) {
+                // This should never happen as we have already determined that the payment is to sapling
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Could not get Sapling payment address.");
+            }
+            if (saplingNoteInputs_.size() == 0 && utxoInputs_.size() > 0) {
+                // Sending from t-addresses, which we don't have ovks for. Instead,
+                // generate a common one from the HD seed. This ensures the data is
+                // recoverable, while keeping it logically separate from the ZIP 32
+                // Sapling key hierarchy, which the user might not be using.
+                HDSeed seed = pwalletMain->GetHDSeedForRPC();
+                ovk = ovkForShieldingFromTaddr(seed);
+            }
+            if (!ovk) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Sending to a Sapling address requires an ovk.");
+            }
+            builder_.AddSaplingOutput(ovk.get(), *saplingPaymentAddress, sendAmount, hexMemo);
+        }
+
+
+        // Build the transaction
+        tx_ = builder_.Build().GetTxOrThrow();
+
+        // Send the transaction
+        // TODO: Use CWallet::CommitTransaction instead of sendrawtransaction
+        auto signedtxn = EncodeHexTx(tx_);
+        if (!testmode) {
+            UniValue params = UniValue(UniValue::VARR);
+            params.push_back(signedtxn);
+            UniValue sendResultValue = sendrawtransaction(params, false);
+            if (sendResultValue.isNull()) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "sendrawtransaction did not return an error or a txid.");
+            }
+
+            auto txid = sendResultValue.get_str();
+
+            UniValue o(UniValue::VOBJ);
+            o.push_back(Pair("txid", txid));
+            set_result(o);
+        } else {
+            // Test mode does not send the transaction to the network.
+            UniValue o(UniValue::VOBJ);
+            o.push_back(Pair("test", 1));
+            o.push_back(Pair("txid", tx_.GetHash().ToString()));
+            o.push_back(Pair("hex", signedtxn));
+            set_result(o);
+        }
+
+        return true;
+    }
+    /**
+     * END SCENARIO #0
+     */
+
 
     /**
      * SCENARIO #1
@@ -303,7 +426,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
      *
      * We only need a single JoinSplit.
      */
-    if (noteInputs_.empty() && isToZaddr_) {
+    if (sproutNoteInputs_.empty() && isToZaddr_) {
         // Create JoinSplit to target z-addr.
         MergeToAddressJSInfo info;
         info.vpub_old = sendAmount;
@@ -326,10 +449,8 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
 
 
     // Copy zinputs to more flexible containers
-    std::deque<MergeToAddressInputNote> zInputsDeque;
-    for (auto o : noteInputs_) {
-        // TODO: Add Sapling support. For now, ensure we can later convert freely.
-        assert(boost::get<libzcash::SproutSpendingKey>(&std::get<3>(o)) != nullptr);
+    std::deque<MergeToAddressInputSproutNote> zInputsDeque;
+    for (const auto& o : sproutNoteInputs_) {
         zInputsDeque.push_back(o);
     }
 
@@ -338,12 +459,12 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
     // to happen as creating a chained joinsplit transaction can take longer than the block interval.
     {
         LOCK2(cs_main, pwalletMain->cs_wallet);
-        for (auto t : noteInputs_) {
+        for (auto t : sproutNoteInputs_) {
             JSOutPoint jso = std::get<0>(t);
             std::vector<JSOutPoint> vOutPoints = {jso};
             uint256 inputAnchor;
-            std::vector<boost::optional<ZCIncrementalWitness>> vInputWitnesses;
-            pwalletMain->GetNoteWitnesses(vOutPoints, vInputWitnesses, inputAnchor);
+            std::vector<boost::optional<SproutWitness>> vInputWitnesses;
+            pwalletMain->GetSproutNoteWitnesses(vOutPoints, vInputWitnesses, inputAnchor);
             jsopWitnessAnchorMap[jso.ToString()] = MergeToAddressWitnessAnchorData{vInputWitnesses[0], inputAnchor};
         }
     }
@@ -369,7 +490,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
 
     // At this point, we are guaranteed to have at least one input note.
     // Use address of first input note as the temporary change address.
-    SproutSpendingKey changeKey = boost::get<libzcash::SproutSpendingKey>(std::get<3>(zInputsDeque.front()));
+    SproutSpendingKey changeKey = std::get<3>(zInputsDeque.front());
     SproutPaymentAddress changeAddress = changeKey.address();
 
     CAmount vpubOldTarget = 0;
@@ -385,7 +506,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
     }
 
     // Keep track of treestate within this transaction
-    boost::unordered_map<uint256, ZCIncrementalMerkleTree, CCoinsKeyHasher> intermediates;
+    boost::unordered_map<uint256, SproutMerkleTree, CCoinsKeyHasher> intermediates;
     std::vector<uint256> previousCommitments;
 
     while (!vpubNewProcessed) {
@@ -406,7 +527,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
 
         CAmount jsInputValue = 0;
         uint256 jsAnchor;
-        std::vector<boost::optional<ZCIncrementalWitness>> witnesses;
+        std::vector<boost::optional<SproutWitness>> witnesses;
 
         JSDescription prevJoinSplit;
 
@@ -428,7 +549,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
             LOCK2(cs_main, pwalletMain->cs_wallet);
 
             // Update tree state with previous joinsplit
-            ZCIncrementalMerkleTree tree;
+            SproutMerkleTree tree;
             auto it = intermediates.find(prevJoinSplit.anchor);
             if (it != intermediates.end()) {
                 tree = it->second;
@@ -437,7 +558,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
             }
 
             assert(changeOutputIndex != -1);
-            boost::optional<ZCIncrementalWitness> changeWitness;
+            boost::optional<SproutWitness> changeWitness;
             int n = 0;
             for (const uint256& commitment : prevJoinSplit.commitments) {
                 tree.append(commitment);
@@ -487,15 +608,15 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
         std::vector<SproutNote> vInputNotes;
         std::vector<SproutSpendingKey> vInputZKeys;
         std::vector<JSOutPoint> vOutPoints;
-        std::vector<boost::optional<ZCIncrementalWitness>> vInputWitnesses;
+        std::vector<boost::optional<SproutWitness>> vInputWitnesses;
         uint256 inputAnchor;
         int numInputsNeeded = (jsChange > 0) ? 1 : 0;
         while (numInputsNeeded++ < ZC_NUM_JS_INPUTS && zInputsDeque.size() > 0) {
-            MergeToAddressInputNote t = zInputsDeque.front();
+            MergeToAddressInputSproutNote t = zInputsDeque.front();
             JSOutPoint jso = std::get<0>(t);
             SproutNote note = std::get<1>(t);
             CAmount noteFunds = std::get<2>(t);
-            SproutSpendingKey zkey = boost::get<libzcash::SproutSpendingKey>(std::get<3>(t));
+            SproutSpendingKey zkey = std::get<3>(t);
             zInputsDeque.pop_front();
 
             MergeToAddressWitnessAnchorData wad = jsopWitnessAnchorMap[jso.ToString()];
@@ -524,7 +645,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
                 wtxHeight = mapBlockIndex[wtx.hashBlock]->nHeight;
                 wtxDepth = wtx.GetDepthInMainChain();
             }
-            LogPrint("zrpcunsafe", "%s: spending note (txid=%s, vjoinsplit=%d, ciphertext=%d, amount=%s, height=%d, confirmations=%d)\n",
+            LogPrint("zrpcunsafe", "%s: spending note (txid=%s, vjoinsplit=%d, jsoutindex=%d, amount=%s, height=%d, confirmations=%d)\n",
                      getId(),
                      jso.hash.ToString().substr(0, 10),
                      jso.js,
@@ -544,7 +665,7 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
                 if (!optionalWitness) {
                     throw JSONRPCError(RPC_WALLET_ERROR, "Witness for note commitment is null");
                 }
-                ZCIncrementalWitness w = *optionalWitness; // could use .get();
+                SproutWitness w = *optionalWitness; // could use .get();
                 if (jsChange > 0) {
                     for (const uint256& commitment : previousCommitments) {
                         w.append(commitment);
@@ -623,6 +744,8 @@ bool AsyncRPCOperation_mergetoaddress::main_impl()
 }
 
 
+extern UniValue signrawtransaction(const UniValue& params, bool fHelp);
+
 /**
  * Sign and send a raw transaction.
  * Raw transaction as hex string should be in object field "rawtxn"
@@ -692,7 +815,7 @@ void AsyncRPCOperation_mergetoaddress::sign_send_raw_transaction(UniValue obj)
 
 UniValue AsyncRPCOperation_mergetoaddress::perform_joinsplit(MergeToAddressJSInfo& info)
 {
-    std::vector<boost::optional<ZCIncrementalWitness>> witnesses;
+    std::vector<boost::optional<SproutWitness>> witnesses;
     uint256 anchor;
     {
         LOCK(cs_main);
@@ -704,18 +827,18 @@ UniValue AsyncRPCOperation_mergetoaddress::perform_joinsplit(MergeToAddressJSInf
 
 UniValue AsyncRPCOperation_mergetoaddress::perform_joinsplit(MergeToAddressJSInfo& info, std::vector<JSOutPoint>& outPoints)
 {
-    std::vector<boost::optional<ZCIncrementalWitness>> witnesses;
+    std::vector<boost::optional<SproutWitness>> witnesses;
     uint256 anchor;
     {
         LOCK(cs_main);
-        pwalletMain->GetNoteWitnesses(outPoints, witnesses, anchor);
+        pwalletMain->GetSproutNoteWitnesses(outPoints, witnesses, anchor);
     }
     return perform_joinsplit(info, witnesses, anchor);
 }
 
 UniValue AsyncRPCOperation_mergetoaddress::perform_joinsplit(
     MergeToAddressJSInfo& info,
-    std::vector<boost::optional<ZCIncrementalWitness>> witnesses,
+    std::vector<boost::optional<SproutWitness>> witnesses,
     uint256 anchor)
 {
     if (anchor.IsNull()) {
@@ -940,7 +1063,10 @@ void AsyncRPCOperation_mergetoaddress::unlock_utxos() {
  */
  void AsyncRPCOperation_mergetoaddress::lock_notes() {
     LOCK2(cs_main, pwalletMain->cs_wallet);
-    for (auto note : noteInputs_) {
+    for (auto note : sproutNoteInputs_) {
+        pwalletMain->LockNote(std::get<0>(note));
+    }
+    for (auto note : saplingNoteInputs_) {
         pwalletMain->LockNote(std::get<0>(note));
     }
 }
@@ -950,7 +1076,10 @@ void AsyncRPCOperation_mergetoaddress::unlock_utxos() {
  */
 void AsyncRPCOperation_mergetoaddress::unlock_notes() {
     LOCK2(cs_main, pwalletMain->cs_wallet);
-    for (auto note : noteInputs_) {
+    for (auto note : sproutNoteInputs_) {
+        pwalletMain->UnlockNote(std::get<0>(note));
+    }
+    for (auto note : saplingNoteInputs_) {
         pwalletMain->UnlockNote(std::get<0>(note));
     }
 }

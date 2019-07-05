@@ -276,7 +276,7 @@ struct CCoinsCacheEntry
 struct CAnchorsSproutCacheEntry
 {
     bool entered; // This will be false if the anchor is removed from the cache
-    ZCIncrementalMerkleTree tree; // The tree itself
+    SproutMerkleTree tree; // The tree itself
     unsigned char flags;
 
     enum Flags {
@@ -289,7 +289,7 @@ struct CAnchorsSproutCacheEntry
 struct CAnchorsSaplingCacheEntry
 {
     bool entered; // This will be false if the anchor is removed from the cache
-    ZCSaplingIncrementalMerkleTree tree; // The tree itself
+    SaplingMerkleTree tree; // The tree itself
     unsigned char flags;
 
     enum Flags {
@@ -341,10 +341,10 @@ class CCoinsView
 {
 public:
     //! Retrieve the tree (Sprout) at a particular anchored root in the chain
-    virtual bool GetSproutAnchorAt(const uint256 &rt, ZCIncrementalMerkleTree &tree) const;
+    virtual bool GetSproutAnchorAt(const uint256 &rt, SproutMerkleTree &tree) const;
 
     //! Retrieve the tree (Sapling) at a particular anchored root in the chain
-    virtual bool GetSaplingAnchorAt(const uint256 &rt, ZCSaplingIncrementalMerkleTree &tree) const;
+    virtual bool GetSaplingAnchorAt(const uint256 &rt, SaplingMerkleTree &tree) const;
 
     //! Determine whether a nullifier is spent or not
     virtual bool GetNullifier(const uint256 &nullifier, ShieldedType type) const;
@@ -389,8 +389,8 @@ protected:
 
 public:
     CCoinsViewBacked(CCoinsView *viewIn);
-    bool GetSproutAnchorAt(const uint256 &rt, ZCIncrementalMerkleTree &tree) const;
-    bool GetSaplingAnchorAt(const uint256 &rt, ZCSaplingIncrementalMerkleTree &tree) const;
+    bool GetSproutAnchorAt(const uint256 &rt, SproutMerkleTree &tree) const;
+    bool GetSaplingAnchorAt(const uint256 &rt, SaplingMerkleTree &tree) const;
     bool GetNullifier(const uint256 &nullifier, ShieldedType type) const;
     bool GetCoins(const uint256 &txid, CCoins &coins) const;
     bool HaveCoins(const uint256 &txid) const;
@@ -460,8 +460,8 @@ public:
     ~CCoinsViewCache();
 
     // Standard CCoinsView methods
-    bool GetSproutAnchorAt(const uint256 &rt, ZCIncrementalMerkleTree &tree) const;
-    bool GetSaplingAnchorAt(const uint256 &rt, ZCSaplingIncrementalMerkleTree &tree) const;
+    bool GetSproutAnchorAt(const uint256 &rt, SproutMerkleTree &tree) const;
+    bool GetSaplingAnchorAt(const uint256 &rt, SaplingMerkleTree &tree) const;
     bool GetNullifier(const uint256 &nullifier, ShieldedType type) const;
     bool GetCoins(const uint256 &txid, CCoins &coins) const;
     bool HaveCoins(const uint256 &txid) const;
@@ -504,6 +504,16 @@ public:
     CCoinsModifier ModifyCoins(const uint256 &txid);
 
     /**
+     * Return a modifiable reference to a CCoins. Assumes that no entry with the given
+     * txid exists and creates a new one. This saves a database access in the case where
+     * the coins were to be wiped out by FromTx anyway. We rely on Zcash-derived block chains
+     * having no duplicate transactions, since BIP 30 and (except for the genesis block)
+     * BIP 34 have been enforced since launch. See the Zcash protocol specification, section
+     * "Bitcoin Improvement Proposals". Simultaneous modifications are not allowed.
+     */
+    CCoinsModifier ModifyNewCoins(const uint256 &txid);
+
+    /**
      * Push the modifications applied to this cache to its base.
      * Failure to call this method before destruction will cause the changes to be forgotten.
      * If false is returned, the state of this cache (and its backing view) will be undefined.
@@ -529,8 +539,8 @@ public:
     //! Check whether all prevouts of the transaction are present in the UTXO set represented by this view
     bool HaveInputs(const CTransaction& tx) const;
 
-    //! Check whether all joinsplit requirements (anchors/nullifiers) are satisfied
-    bool HaveJoinSplitRequirements(const CTransaction& tx) const;
+    //! Check whether all joinsplit and sapling spend requirements (anchors/nullifiers) are satisfied
+    bool HaveShieldedRequirements(const CTransaction& tx) const;
 
     //! Return priority of tx at height nHeight
     double GetPriority(const CTransaction &tx, int nHeight) const;

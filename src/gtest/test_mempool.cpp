@@ -19,11 +19,11 @@ class FakeCoinsViewDB : public CCoinsView {
 public:
     FakeCoinsViewDB() {}
 
-    bool GetSproutAnchorAt(const uint256 &rt, ZCIncrementalMerkleTree &tree) const {
+    bool GetSproutAnchorAt(const uint256 &rt, SproutMerkleTree &tree) const {
         return false;
     }
 
-    bool GetSaplingAnchorAt(const uint256 &rt, ZCSaplingIncrementalMerkleTree &tree) const {
+    bool GetSaplingAnchorAt(const uint256 &rt, SaplingMerkleTree &tree) const {
         return false;
     }
 
@@ -248,7 +248,7 @@ TEST(Mempool, SproutNegativeVersionTxWhenOverwinterActive) {
     mtx.vjoinsplit.resize(0); // no joinsplits
     mtx.fOverwintered = false;
 
-    // A Sprout transaction with version -3 is created using Sprout code (as found in Zcashd <= 1.0.14).
+    // A Sprout transaction with version -3 is created using Sprout code (as found in zcashd <= 1.0.14).
     // First four bytes of transaction, parsed as an uint32_t, has the value: 0xfffffffd
     // This test simulates an Overwinter node receiving this transaction, but incorrectly deserializing the
     // transaction due to a (pretend) bug of not detecting the most significant bit, which leads
@@ -266,7 +266,7 @@ TEST(Mempool, SproutNegativeVersionTxWhenOverwinterActive) {
         EXPECT_EQ(state1.GetRejectReason(), "bad-txns-version-too-low");
     }
 
-    // A Sprout transaction with version -3 created using Overwinter code (as found in Zcashd >= 1.0.15).
+    // A Sprout transaction with version -3 created using Overwinter code (as found in zcashd >= 1.0.15).
     // First four bytes of transaction, parsed as an uint32_t, has the value: 0x80000003
     // This test simulates the same pretend bug described above.
     // The resulting Sprout tx with nVersion -2147483645 should be rejected by the Overwinter node's mempool.
@@ -280,6 +280,38 @@ TEST(Mempool, SproutNegativeVersionTxWhenOverwinterActive) {
         CValidationState state1;
         EXPECT_FALSE(AcceptToMemoryPool(pool, state1, tx1, false, &missingInputs));
         EXPECT_EQ(state1.GetRejectReason(), "bad-txns-version-too-low");
+    }
+
+    // Revert to default
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT);
+}
+
+
+TEST(Mempool, ExpiringSoonTxRejection) {
+    SelectParams(CBaseChainParams::REGTEST);
+    UpdateNetworkUpgradeParameters(Consensus::UPGRADE_OVERWINTER, Consensus::NetworkUpgrade::ALWAYS_ACTIVE);
+
+    CTxMemPool pool(::minRelayTxFee);
+    bool missingInputs;
+    CMutableTransaction mtx = GetValidTransaction();
+    mtx.vjoinsplit.resize(0); // no joinsplits
+    mtx.fOverwintered = true;
+    mtx.nVersion = OVERWINTER_TX_VERSION;
+    mtx.nVersionGroupId = OVERWINTER_VERSION_GROUP_ID;
+
+    // The next block height is 0 since there is no active chain and current height is -1.
+    // Given an expiring soon threshold of 3 blocks, a tx is considered to be expiring soon
+    // if the tx expiry height is set to 0, 1 or 2.  However, at the consensus level,
+    // expiry height is ignored when set to 0, therefore we start testing from 1.
+    for (int i = 1; i < TX_EXPIRING_SOON_THRESHOLD; i++)
+    {
+        mtx.nExpiryHeight = i;
+
+        CValidationState state1;
+        CTransaction tx1(mtx);
+
+        EXPECT_FALSE(AcceptToMemoryPool(pool, state1, tx1, false, &missingInputs));
+        EXPECT_EQ(state1.GetRejectReason(), "tx-expiring-soon");
     }
 
     // Revert to default

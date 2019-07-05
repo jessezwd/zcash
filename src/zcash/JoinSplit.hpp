@@ -25,12 +25,12 @@ typedef boost::variant<PHGRProof, GrothProof> SproutProof;
 
 class JSInput {
 public:
-    ZCIncrementalWitness witness;
+    SproutWitness witness;
     SproutNote note;
     SproutSpendingKey key;
 
     JSInput();
-    JSInput(ZCIncrementalWitness witness,
+    JSInput(SproutWitness witness,
             SproutNote note,
             SproutSpendingKey key) : witness(witness), note(note), key(key) { }
 
@@ -66,6 +66,8 @@ public:
                          const std::array<uint256, NumInputs>& nullifiers,
                          const uint256& joinSplitPubKey
                         );
+
+    virtual void saveR1CS(std::string path) = 0;
 
     // Compute nullifiers, macs, note commitments & encryptions, and SNARK proof
     virtual SproutProof prove(

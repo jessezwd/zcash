@@ -1,13 +1,18 @@
 rust_crates := \
+  crate_aes \
+  crate_aesni \
+  crate_aes_soft \
   crate_arrayvec \
-  crate_bellman \
   crate_bitflags \
   crate_bit_vec \
   crate_blake2_rfc \
+  crate_block_cipher_trait \
+  crate_byte_tools \
   crate_byteorder \
   crate_constant_time_eq \
   crate_crossbeam \
   crate_digest \
+  crate_fpe \
   crate_fuchsia_zircon \
   crate_fuchsia_zircon_sys \
   crate_futures_cpupool \
@@ -16,10 +21,13 @@ rust_crates := \
   crate_lazy_static \
   crate_libc \
   crate_nodrop \
+  crate_num_bigint \
   crate_num_cpus \
-  crate_pairing \
+  crate_num_integer \
+  crate_num_traits \
+  crate_opaque_debug \
   crate_rand \
-  crate_sapling_crypto \
+  crate_stream_cipher \
   crate_typenum \
   crate_winapi_i686_pc_windows_gnu \
   crate_winapi \
